@@ -19,6 +19,9 @@
   - afl-cc:
     - Fixes in the PCGUARD and LTO instrumentation that could lead to sanitizer
       triggers in target binaries
+    - LTO: `AFL_LLVM_NGRAM_SIZE` now also activates an in-function, strictly
+      non-colliding ngram coverage that composes with `AFL_LLVM_CALLER`/CTX.
+      Build aborts if the resulting map would exceed 2,000,000 edges.
   - IJON dist was changed to original IJON implementation: initial matching
     bytes, max length is 1024
   - lib* tools:

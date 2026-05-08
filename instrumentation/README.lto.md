@@ -160,6 +160,32 @@ Setting `export AFL_LLVM_DOCUMENT_IDS=file` will document in a file which edge
 ID was given to which function. This helps to identify functions with variable
 bytes or which functions were touched by an input.
 
+## In-function ngram coverage (AFL_LLVM_NGRAM_SIZE)
+
+`afl-clang-lto` honors `AFL_LLVM_NGRAM_SIZE` to add an *in-function*,
+**strictly non-colliding** ngram coverage on top of the existing CALLER/CTX
+expansion. The N-1 most recent in-function edge indices are tracked verbatim
+(no XOR hashing) and combined with the caller-id via positional/polynomial
+encoding. Each `(call_site, edge_history, current_edge)` tuple gets its own
+map slot. The history is reset on function entry, callees save/restore
+through a stack alloca, and ngram tracking does not cross function
+boundaries.
+
+```
+AFL_LLVM_NGRAM_SIZE=4 AFL_LLVM_CALLER=1 afl-clang-lto -o foo foo.c
+```
+
+- Valid range: 1..16. `1` (or unset) means disabled. Default if set with an
+  empty/invalid value is 4.
+- Requires CALLER/CTX. If only `AFL_LLVM_NGRAM_SIZE` is set, the pass
+  auto-enables CALLER and prints a notice.
+- Per-function map reservation grows by `I^(N-1)` where `I` is the number of
+  edges in the function. With many edges and a high `N` the map blows up
+  quickly; the LTO pass aborts the build if the total instrumented edge
+  count would exceed 2,000,000. Use only on small targets.
+- The runtime TLS storage `__afl_prev_loc[NGRAM_SIZE_MAX]` is reused (no
+  runtime change required).
+
 ## Solving difficult targets
 
 Some targets are difficult because the configure script does unusual stuff that

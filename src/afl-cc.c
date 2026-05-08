@@ -895,13 +895,23 @@ static void instrument_mode_old_environ(aflcc_state_t *aflcc) {
 
   if (getenv("AFL_LLVM_NGRAM_SIZE")) {
 
-    aflcc->instrument_opt_mode |= INSTRUMENT_OPT_NGRAM;
     aflcc->ngram_size = atoi(getenv("AFL_LLVM_NGRAM_SIZE"));
-    if (aflcc->ngram_size < 2 || aflcc->ngram_size > NGRAM_SIZE_MAX)
+    if (aflcc->ngram_size > NGRAM_SIZE_MAX)
       FATAL(
-          "NGRAM instrumentation mode must be between 2 and NGRAM_SIZE_MAX "
+          "NGRAM instrumentation mode must be between 1 and NGRAM_SIZE_MAX "
           "(%u)",
           NGRAM_SIZE_MAX);
+    /* N=1 means "no history" -> disabled; mirror afl-llvm-pass.so.cc.       */
+    if (aflcc->ngram_size <= 1) {
+
+      aflcc->ngram_size = 0;
+      unsetenv("AFL_LLVM_NGRAM_SIZE");
+
+    } else {
+
+      aflcc->instrument_opt_mode |= INSTRUMENT_OPT_NGRAM;
+
+    }
 
   }
 
@@ -1219,15 +1229,19 @@ static void instrument_opt_mode_exclude(aflcc_state_t *aflcc) {
 
   }
 
+  /* In LTO mode, CALLER and NGRAM (which composes with CALLER) are
+     supported by SanitizerCoverageLTO.so; CTX_K is not. */
   if (aflcc->instrument_opt_mode && aflcc->compiler_mode != LLVM &&
-      !((aflcc->instrument_opt_mode & INSTRUMENT_OPT_CALLER) &&
+      !((aflcc->instrument_opt_mode &
+         (INSTRUMENT_OPT_CALLER | INSTRUMENT_OPT_NGRAM)) &&
         aflcc->compiler_mode == LTO))
     FATAL("CTX, CALLER and NGRAM can only be used in LLVM mode");
 
   if (aflcc->instrument_opt_mode &&
       aflcc->instrument_opt_mode != INSTRUMENT_OPT_CODECOV &&
       aflcc->instrument_mode != INSTRUMENT_CLASSIC &&
-      !(aflcc->instrument_opt_mode & INSTRUMENT_OPT_CALLER &&
+      !((aflcc->instrument_opt_mode &
+         (INSTRUMENT_OPT_CALLER | INSTRUMENT_OPT_NGRAM)) &&
         aflcc->compiler_mode == LTO))
     FATAL(
         "CALLER, CTX and NGRAM instrumentation options can only be used with "

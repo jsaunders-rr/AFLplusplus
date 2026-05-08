@@ -72,10 +72,13 @@
 #include "config.h"
 #include "debug.h"
 #include "afl-llvm-common.h"
+#include "llvm-alternative-coverage.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "sancov"
+
+#define AFL_HAVE_VECTOR_INTRINSICS 1
 
 const char SanCovTracePCName[] = "__sanitizer_cov_trace_pc";
 // const char SanCovTracePCGuardName =
@@ -205,6 +208,11 @@ class ModuleSanitizerCoverageLTO
   void InjectCoverageAtBlock(Function &F, BasicBlock &BB, size_t Idx,
                              bool IsLeafFunc = true);
 
+  /* ngram helpers — usable from both InjectCoverageAtBlock and the
+     instrumentFunction lambdas.  No-op when ngram_size == 0. */
+  Value *computeNgramOffset(IRBuilder<> &IRB);
+  void   pushPrevLoc(IRBuilder<> &IRB, Value *InFuncIdx_i32);
+
   std::string    getSectionName(const std::string &Section) const;
   FunctionCallee SanCovTracePC /*, SanCovTracePCGuard*/;
   Type *IntptrTy, *IntptrPtrTy, *Int64Ty, *Int64PtrTy, *Int32Ty, *Int32PtrTy,
@@ -233,6 +241,7 @@ class ModuleSanitizerCoverageLTO
   uint32_t                         instrument_ctx = 0;
   uint32_t                         instrument_ctx_max_depth = 0;
   uint32_t                         extra_ctx_inst = 0;
+  uint32_t                         ngram_size = 0;  // 0 = disabled, else 2..16
   uint64_t                         map_addr = 0;
   const char                      *skip_nozero = NULL;
   const char                      *use_threadsafe_counters = nullptr;
@@ -251,10 +260,18 @@ class ModuleSanitizerCoverageLTO
   GlobalVariable                  *AFLMapPtr = NULL;
   GlobalVariable                  *AFLCovMapSize = NULL;
   GlobalVariable                  *AFLIJONState = NULL;
+  GlobalVariable                  *AFLPrevLoc = NULL;       // ngram TLS vec
+  Constant                        *PrevLocShuffleMask = NULL;
+  VectorType                      *PrevLocTy = NULL;
+  IntegerType                     *PrevLocIntTy = NULL;     // PREV_LOC_T width
   const char                      *ijon_enabled = nullptr;
   Value                           *MapPtrFixed = NULL;
   Value                           *HoistedMapPtr = NULL;
   AllocaInst                      *CTX_add = NULL;
+  AllocaInst                      *PrevLocSave = NULL;      // per-function
+  uint32_t                         save_global_id = 0;      // per-function
+  uint32_t                         current_inst_in_this_func = 0;  // per-fn
+  uint32_t                         current_call_counter = 0;       // per-fn
   std::ofstream                    dFile;
   size_t                           found = 0;
   bool                             deny_exec = false;
@@ -485,13 +502,66 @@ bool ModuleSanitizerCoverageLTO::instrumentModule(
 
   }
 
+  /* AFL_LLVM_NGRAM_SIZE — in-function, strictly non-colliding ngram, layered
+     on top of CALLER/CTX.  Range 1..16; default 4 on empty/garbage; 1 means
+     disabled.  Requires CALLER/CTX — auto-enabled if missing. */
+  {
+
+    const char *ngram_str = getenv("AFL_LLVM_NGRAM_SIZE");
+    if (!ngram_str) ngram_str = getenv("AFL_NGRAM_SIZE");
+    if (ngram_str) {
+
+      uint32_t n = 0;
+      if (ngram_str[0] == 0 || sscanf(ngram_str, "%u", &n) != 1) { n = 4; }
+      if (n > NGRAM_SIZE_MAX) {
+
+        FATAL(
+            "Bad value of AFL_LLVM_NGRAM_SIZE (must be between 1 and %u)",
+            NGRAM_SIZE_MAX);
+
+      }
+
+      if (n <= 1) {
+
+        ngram_size = 0;  // 1 == disabled
+
+      } else {
+
+        ngram_size = n;
+        if (!instrument_ctx) {
+
+          instrument_ctx = 1;
+          if (!getenv("AFL_QUIET")) {
+
+            SAYF(cMGN "[+] " cRST
+                      "AFL_LLVM_NGRAM_SIZE auto-enables AFL_LLVM_CALLER\n");
+
+          }
+
+        }
+
+      }
+
+    }
+
+  }
+
   if ((isatty(2) && !getenv("AFL_QUIET")) || debug) {
 
-    char buf[64] = {};
+    char buf[96] = {};
     if (instrument_ctx) {
 
-      snprintf(buf, sizeof(buf), " (CTX mode, depth %u)\n",
-               instrument_ctx_max_depth);
+      if (ngram_size) {
+
+        snprintf(buf, sizeof(buf), " (CTX mode, depth %u, ngram %u)\n",
+                 instrument_ctx_max_depth, ngram_size);
+
+      } else {
+
+        snprintf(buf, sizeof(buf), " (CTX mode, depth %u)\n",
+                 instrument_ctx_max_depth);
+
+      }
 
     }
 
@@ -579,6 +649,43 @@ bool ModuleSanitizerCoverageLTO::instrumentModule(
   AFLContext = new GlobalVariable(
       M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_prev_ctx", 0,
       GlobalVariable::GeneralDynamicTLSModel, 0, false);
+
+  /* AFL_LLVM_NGRAM_SIZE: declare the TLS prev-loc vector and a shuffle mask
+     for the in-function shift register.  The runtime declares
+     __afl_prev_loc[NGRAM_SIZE_MAX] (see afl-compiler-rt.o.c) which is
+     vector-aligned for use as an LLVM vector operand. */
+  if (ngram_size) {
+
+    PrevLocIntTy =
+        IntegerType::getIntNTy(*Ct, sizeof(PREV_LOC_T) * CHAR_BIT);
+    /* History length is N-1 entries (last N-1 in-function edge indices). */
+    PrevLocTy = VectorType::get(PrevLocIntTy, ngram_size - 1, false);
+
+  #if defined(__ANDROID__) || defined(__HAIKU__) || defined(NO_TLS)
+    AFLPrevLoc = new GlobalVariable(
+        M, PrevLocTy, /* isConstant */ false, GlobalValue::ExternalLinkage,
+        /* Initializer */ nullptr, "__afl_prev_loc");
+  #else
+    AFLPrevLoc = new GlobalVariable(
+        M, PrevLocTy, /* isConstant */ false, GlobalValue::ExternalLinkage,
+        /* Initializer */ nullptr, "__afl_prev_loc",
+        /* InsertBefore */ nullptr, GlobalVariable::GeneralDynamicTLSModel,
+        /* AddressSpace */ 0, /* IsExternallyInitialized */ false);
+  #endif
+
+    /* Shuffle mask: drop the oldest (highest) element, shift the rest by 1
+       so we can InsertElement the newest at index 0.
+       Mask = [undef, 0, 1, ..., N-3]  (length N-1, over Int32Ty). */
+    SmallVector<Constant *, 16> Mask;
+    Mask.push_back(UndefValue::get(Int32Ty));
+    for (uint32_t i = 0; i + 1 < ngram_size - 1; ++i) {
+
+      Mask.push_back(ConstantInt::get(Int32Ty, i));
+
+    }
+    PrevLocShuffleMask = ConstantVector::get(Mask);
+
+  }
 
   Zero = ConstantInt::get(Int8Tyi, 0);
   Zero32 = ConstantInt::get(Int32Tyi, 0);
@@ -1547,6 +1654,10 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
   LoadInst                *PrevCtxLoad = NULL;
 
   CTX_add = NULL;
+  PrevLocSave = NULL;
+  save_global_id = save_global;
+  current_inst_in_this_func = 0;
+  current_call_counter = 0;
 
   if (debug) fprintf(stderr, "Function: %s\n", F.getName().str().c_str());
 
@@ -1708,6 +1819,8 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
       if (inst > inst_save + 1) {
 
         inst_in_this_func = inst - inst_save;
+        current_inst_in_this_func = inst_in_this_func;
+        current_call_counter = call_counter;
         bool done = false;
 
         // in rare occasions there can be multiple entry points per function
@@ -1781,6 +1894,23 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
             auto nosan = IRB.CreateStore(CTX_offset, CTX_add);
             nosan->setMetadata("nosanitize", N);
 
+            // ngram: save the caller's prev_loc into a per-function stack
+            // alloca, then zero __afl_prev_loc.  History is restored at every
+            // return/resume.
+            if (ngram_size && AFLPrevLoc) {
+
+              PrevLocSave =
+                  IRB.CreateAlloca(PrevLocTy, nullptr, "PrevLocSave");
+              auto *Loaded = IRB.CreateLoad(PrevLocTy, AFLPrevLoc);
+              Loaded->setMetadata("nosanitize", N);
+              auto *Saved = IRB.CreateStore(Loaded, PrevLocSave);
+              Saved->setMetadata("nosanitize", N);
+              auto *Zeroed = IRB.CreateStore(
+                  ConstantAggregateZero::get(PrevLocTy), AFLPrevLoc);
+              Zeroed->setMetadata("nosanitize", N);
+
+            }
+
             if (debug)
               fprintf(
                   stderr, "DEBUG: extra CTX instrumentations for %s: %u * %u\n",
@@ -1840,7 +1970,29 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 #endif
         CTX_add);
     setNoSanitizeMetadata(CTX_load);
-    return IRB.CreateAdd(V, CTX_load);
+    Value *Offset = CTX_load;
+    if (Value *NgOff = computeNgramOffset(IRB)) {
+
+      Offset = IRB.CreateAdd(Offset, NgOff);
+
+    }
+    return IRB.CreateAdd(V, Offset);
+
+  };
+
+  /* ngram helper for two-edge instrumentation sites (select-on-cond,
+     icmp/fcmp/cmpxchg/atomicrmw): push the in-function index of the chosen
+     edge into the prev_loc shift register.  No-op if ngram is disabled or
+     gids are 0 (uninitialised, e.g. for vector-cond cases we skip).        */
+  auto pushChosenPair = [&](IRBuilder<> &IRB, Value *cond, uint32_t gid1,
+                            uint32_t gid2) {
+
+    if (!ngram_size || !AFLPrevLoc) return;
+    if (!gid1 || !gid2) return;
+    Value *idx_chosen = IRB.CreateSelect(
+        cond, ConstantInt::get(Int32Ty, gid1 - save_global - 1),
+        ConstantInt::get(Int32Ty, gid2 - save_global - 1));
+    pushPrevLoc(IRB, idx_chosen);
 
   };
 
@@ -2014,10 +2166,18 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
         if (FuncName.compare(StringRef("__afl_coverage_interesting"))) continue;
 
         IRBuilder<> Builder(callInst);
+        uint32_t    gid_one = ++afl_global_id;
         Value      *val =
-            applyCtxOffset(Builder, ConstantInt::get(Int32Ty, ++afl_global_id));
+            applyCtxOffset(Builder, ConstantInt::get(Int32Ty, gid_one));
 
         callInst->setOperand(1, val);
+        if (ngram_size && AFLPrevLoc && current_inst_in_this_func) {
+
+          uint32_t in_func_idx = gid_one - save_global - 1;
+          pushPrevLoc(Builder,
+                      ConstantInt::get(Int32Tyi, in_func_idx));
+
+        }
         ++inst;
 
       }
@@ -2045,6 +2205,8 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
       if (auto *selectInst = dyn_cast<SelectInst>(&IN)) {
 
         uint32_t    vector_cnt = 0;
+        uint32_t    gid_a = 0, gid_b = 0;
+        Value      *frozen_cond_scalar = nullptr;
         Value      *condition = selectInst->getCondition();
         Value      *result = nullptr;
         auto        t = condition->getType();
@@ -2054,11 +2216,14 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
           Value *frozen_cond = IRB.CreateFreeze(condition);
           markAflSkip(frozen_cond);
+          gid_a = ++afl_global_id;
           Value *val1 =
-              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, gid_a));
+          gid_b = ++afl_global_id;
           Value *val2 =
-              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, gid_b));
           result = IRB.CreateSelect(frozen_cond, val1, val2);
+          frozen_cond_scalar = frozen_cond;
           inst += 2;
 
         } else
@@ -2118,11 +2283,14 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
           markAflSkip(frozen_cond);
           Value *reduced = IRB.CreateOrReduce(frozen_cond);
           markAflSkip(reduced);
+          gid_a = ++afl_global_id;
           Value *val1 =
-              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, gid_a));
+          gid_b = ++afl_global_id;
           Value *val2 =
-              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, gid_b));
           result = IRB.CreateSelect(reduced, val1, val2);
+          frozen_cond_scalar = reduced;
           inst += 2;
 
         } else
@@ -2138,11 +2306,15 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
         if (!result) continue;
         markAflSkip(result);
         updateBitmapForResult(IRB, result, vector_cnt);
+        if (vector_cnt == 0)
+          pushChosenPair(IRB, frozen_cond_scalar, gid_a, gid_b);
         decision_cnt++;
 
       } else {
 
         uint32_t    vector_cnt = 0;
+        uint32_t    gid_a = 0, gid_b = 0;
+        Value      *cond_for_push = nullptr;
         Value      *result = nullptr;
         IRBuilder<> IRB(IN.getNextNode());
 
@@ -2152,12 +2324,15 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
           Value *res = IRB.CreateFreeze(icmp);
           markAflSkip(res);
+          gid_a = ++afl_global_id;
           Value *val1 =
-              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, gid_a));
+          gid_b = ++afl_global_id;
           Value *val2 =
-              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, gid_b));
           result = IRB.CreateSelect(res, val1, val2);
           markAflSkip(result);
+          cond_for_push = res;
           inst += 2;
 
         } else if (auto *fcmp = dyn_cast<FCmpInst>(&IN)) {
@@ -2166,12 +2341,15 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
           Value *res = IRB.CreateFreeze(fcmp);
           markAflSkip(res);
+          gid_a = ++afl_global_id;
           Value *val1 =
-              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, gid_a));
+          gid_b = ++afl_global_id;
           Value *val2 =
-              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, gid_b));
           result = IRB.CreateSelect(res, val1, val2);
           markAflSkip(result);
+          cond_for_push = res;
           inst += 2;
 
         } else if (auto *cxchg = dyn_cast<AtomicCmpXchgInst>(&IN)) {
@@ -2180,12 +2358,15 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
           markAflSkip(extracted);
           Value *res = IRB.CreateFreeze(extracted);
           markAflSkip(res);
+          gid_a = ++afl_global_id;
           Value *val1 =
-              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, gid_a));
+          gid_b = ++afl_global_id;
           Value *val2 =
-              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, gid_b));
           result = IRB.CreateSelect(res, val1, val2);
           markAflSkip(result);
+          cond_for_push = res;
           inst += 2;
 
         } else if (auto *rmw = dyn_cast<AtomicRMWInst>(&IN)) {
@@ -2239,12 +2420,15 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
           markAflSkip(cmp);
           Value *res = IRB.CreateFreeze(cmp);
           markAflSkip(res);
+          gid_a = ++afl_global_id;
           Value *val1 =
-              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, gid_a));
+          gid_b = ++afl_global_id;
           Value *val2 =
-              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, gid_b));
           result = IRB.CreateSelect(res, val1, val2);
           markAflSkip(result);
+          cond_for_push = res;
           inst += 2;
 
         }
@@ -2253,6 +2437,7 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
         markAflSkip(result);
         updateBitmapForResult(IRB, result, vector_cnt);
+        pushChosenPair(IRB, cond_for_push, gid_a, gid_b);
         decision_cnt++;
 
       }
@@ -2273,6 +2458,27 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
             inst_save, inst - inst_save, afl_global_id, save_global,
             afl_global_id - save_global);*/
 
+  // ngram: restore the caller's prev_loc at every return / resume.
+  if (PrevLocSave && AFLPrevLoc) {
+
+    MDNode *NoSan =
+        MDNode::get(F.getContext(),
+                    MDString::get(F.getContext(), "nosanitize"));
+    for (auto &BB : F) {
+
+      Instruction *Term = BB.getTerminator();
+      if (!Term) continue;
+      if (!isa<ReturnInst>(Term) && !isa<ResumeInst>(Term)) continue;
+      IRBuilder<> Post_IRB(Term);
+      auto       *Reload = Post_IRB.CreateLoad(PrevLocTy, PrevLocSave);
+      Reload->setMetadata("nosanitize", NoSan);
+      auto *Restore = Post_IRB.CreateStore(Reload, AFLPrevLoc);
+      Restore->setMetadata("nosanitize", NoSan);
+
+    }
+
+  }
+
   if (inst_in_this_func && call_counter > 1) {
 
     if (inst_in_this_func != afl_global_id - save_global) {
@@ -2285,8 +2491,42 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
     }
 
-    uint32_t extra_ctx_inst_in_this_func =
-        inst_in_this_func * (call_counter - 1);
+    uint32_t extra_ctx_inst_in_this_func;
+
+    if (ngram_size) {
+
+      // Strict non-colliding ngram: per-function reservation = I^N * C.
+      // I edges are already counted in inst_in_this_func; reserve the rest.
+      uint64_t I = inst_in_this_func;
+      uint64_t C = call_counter;
+      uint64_t Total = I * C;  // I^1 * C
+      for (uint32_t i = 1; i < ngram_size; ++i) {
+
+        Total *= I;  // becomes I^N * C in the end
+
+      }
+      // Cap at 2,000,000 total program edges.
+      if (Total > 2'000'000ULL ||
+          (uint64_t)afl_global_id + Total - I > 2'000'000ULL) {
+
+        FATAL(
+            "AFL_LLVM_NGRAM_SIZE=%u exceeds the 2,000,000 edge cap on this "
+            "target (function %s would need %llu slots, "
+            "current total %u). Reduce AFL_LLVM_NGRAM_SIZE or shrink the "
+            "target.",
+            ngram_size, F.getName().str().c_str(),
+            (unsigned long long)Total, afl_global_id);
+
+      }
+
+      extra_ctx_inst_in_this_func = (uint32_t)(Total - I);
+
+    } else {
+
+      extra_ctx_inst_in_this_func =
+          inst_in_this_func * (call_counter - 1);
+
+    }
 
     extra_ctx_inst += extra_ctx_inst_in_this_func;
     afl_global_id += extra_ctx_inst_in_this_func;
@@ -2458,7 +2698,13 @@ void ModuleSanitizerCoverageLTO::InjectCoverageAtBlock(Function   &F,
 #endif
           CTX_add);
       setNoSanitizeMetadata(CTX_load);
-      val = IRB.CreateAdd(CurLoc, CTX_load);
+      Value *Offset = CTX_load;
+      if (Value *NgOff = computeNgramOffset(IRB)) {
+
+        Offset = IRB.CreateAdd(Offset, NgOff);
+
+      }
+      val = IRB.CreateAdd(CurLoc, Offset);
 
     }
 
@@ -2518,6 +2764,16 @@ void ModuleSanitizerCoverageLTO::InjectCoverageAtBlock(Function   &F,
 
     // done :)
 
+    // ngram: push the in-function index of this edge into the prev_loc
+    // shift register.  Index = (afl_global_id - save_global_id) - 1, since
+    // afl_global_id was incremented for this edge above.
+    if (ngram_size && AFLPrevLoc && current_inst_in_this_func) {
+
+      uint32_t in_func_idx = afl_global_id - save_global_id - 1;
+      pushPrevLoc(IRB, ConstantInt::get(Int32Tyi, in_func_idx));
+
+    }
+
     ++inst;
     // AFL++ END
 
@@ -2531,6 +2787,75 @@ void ModuleSanitizerCoverageLTO::InjectCoverageAtBlock(Function   &F,
     */
 
   }
+
+}
+
+/* ngram: positional/polynomial encoding of last (N-1) in-function edge
+   indices.  Returns nullptr if ngram is disabled or no per-function context.
+   Otherwise returns an i32 = I*C*hist_idx where
+   hist_idx = e0 + I*e1 + I^2*e2 + ... and ei are the elements of the TLS
+   prev_loc vector. */
+Value *ModuleSanitizerCoverageLTO::computeNgramOffset(IRBuilder<> &IRB) {
+
+  if (!ngram_size || !AFLPrevLoc || !PrevLocTy) return nullptr;
+  if (!current_inst_in_this_func || !current_call_counter) return nullptr;
+
+  uint32_t I = current_inst_in_this_func;
+  uint32_t C = current_call_counter;
+  uint64_t IC = (uint64_t)I * (uint64_t)C;
+
+  auto *PrevLoad = IRB.CreateLoad(PrevLocTy, AFLPrevLoc);
+  setNoSanitizeMetadata(PrevLoad);
+
+  Value   *Hist = ConstantInt::get(Int32Ty, 0);
+  uint64_t Pow = 1;
+  for (uint32_t i = 0; i + 1 < ngram_size; ++i) {
+
+    Value *Elt = IRB.CreateExtractElement(PrevLoad, (uint64_t)i);
+    Value *EltZ = IRB.CreateZExt(Elt, Int32Ty);
+    if (Pow != 1) {
+
+      EltZ = IRB.CreateMul(EltZ, ConstantInt::get(Int32Ty, (uint32_t)Pow));
+
+    }
+    Hist = IRB.CreateAdd(Hist, EltZ);
+    Pow *= I;
+    if (Pow == 0) break;
+
+  }
+
+  return IRB.CreateMul(Hist, ConstantInt::get(Int32Ty, (uint32_t)IC));
+
+}
+
+/* ngram: shift the prev_loc vector (drop oldest, shift rest by 1) and
+   insert the new in-function index at slot 0. */
+void ModuleSanitizerCoverageLTO::pushPrevLoc(IRBuilder<> &IRB,
+                                             Value      *InFuncIdx_i32) {
+
+  if (!ngram_size || !AFLPrevLoc || !PrevLocTy || !PrevLocShuffleMask)
+    return;
+
+  auto *PrevLoad = IRB.CreateLoad(PrevLocTy, AFLPrevLoc);
+  setNoSanitizeMetadata(PrevLoad);
+  Value *Shifted;
+  if (ngram_size > 2) {
+
+    Shifted = IRB.CreateShuffleVector(
+        PrevLoad, UndefValue::get(PrevLocTy), PrevLocShuffleMask);
+
+  } else {
+
+    /* N==2: vector length is 1 — shuffle would be a no-op then we just
+       overwrite slot 0.  Skip the shuffle. */
+    Shifted = PrevLoad;
+
+  }
+  Value *Trunc = IRB.CreateTrunc(InFuncIdx_i32, PrevLocIntTy);
+  Value *Updated =
+      IRB.CreateInsertElement(Shifted, Trunc, (uint64_t)0);
+  auto  *Store = IRB.CreateStore(Updated, AFLPrevLoc);
+  setNoSanitizeMetadata(Store);
 
 }
 
