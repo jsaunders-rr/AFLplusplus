@@ -1717,7 +1717,13 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
     }
 
-    if (call_counter > 1) {
+    /* Enter the fake-instrumentation/setup block when we have either
+       multi-caller CTX expansion (call_counter > 1) OR ngram is on (which
+       applies to every instrumented function regardless of caller count).
+       In the ngram-only path we don't insert CTX call-id stores (no callers
+       to write into) and don't build the CTX_add alloca; we only need
+       inst_in_this_func, the prev_loc save/zero, and BlocksToInstrument.    */
+    if (call_counter > 1 || ngram_size) {
 
       // Fake instrumentation so we can count how many instrumentations there
       // will be in this function
@@ -1820,13 +1826,16 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
         inst_in_this_func = inst - inst_save;
         current_inst_in_this_func = inst_in_this_func;
-        current_call_counter = call_counter;
+        /* Effective C for slot math: real call_counter when CTX expanded,
+           else 1 (no caller axis, ngram is the only expansion).            */
+        current_call_counter = (call_counter > 1) ? call_counter : 1;
         bool done = false;
 
         // in rare occasions there can be multiple entry points per function
         for (auto &BB : F) {
 
-          if (&BB == &F.getEntryBlock() && done == false) {
+          if (&BB == &F.getEntryBlock() && done == false &&
+              call_counter > 1) {
 
             // we insert a CTX value in all our callers:
             IRBuilder<> Builder(Context);
@@ -1871,32 +1880,41 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
           }
 
-          // in all entrypoints we have to load the CTX value
+          // in all entrypoints we have to set up CTX_add and/or ngram state.
           if (&BB == &F.getEntryBlock()) {
 
-            Value               *CTX_offset;
             BasicBlock::iterator IP = BB.getFirstInsertionPt();
             IRBuilder<>          IRB(&(*IP));
 
-            PrevCtxLoad = IRB.CreateLoad(
+            if (call_counter > 1) {
+
+              PrevCtxLoad = IRB.CreateLoad(
 #if LLVM_VERSION_MAJOR >= 14
-                IRB.getInt32Ty(),
+                  IRB.getInt32Ty(),
 #endif
-                AFLContext);
-            PrevCtxLoad->setMetadata("nosanitize", N);
+                  AFLContext);
+              PrevCtxLoad->setMetadata("nosanitize", N);
 
-            CTX_offset = IRB.CreateMul(
-                ConstantInt::get(Type::getInt32Ty(Context), inst_in_this_func),
-                PrevCtxLoad, "CTXmul", false, true);
+              Value *CTX_offset = IRB.CreateMul(
+                  ConstantInt::get(Type::getInt32Ty(Context), inst_in_this_func),
+                  PrevCtxLoad, "CTXmul", false, true);
 
-            CTX_add =
-                IRB.CreateAlloca(Type::getInt32Ty(Context), nullptr, "CTX_add");
-            auto nosan = IRB.CreateStore(CTX_offset, CTX_add);
-            nosan->setMetadata("nosanitize", N);
+              CTX_add = IRB.CreateAlloca(Type::getInt32Ty(Context), nullptr,
+                                         "CTX_add");
+              auto nosan = IRB.CreateStore(CTX_offset, CTX_add);
+              nosan->setMetadata("nosanitize", N);
+
+              if (debug)
+                fprintf(stderr,
+                        "DEBUG: extra CTX instrumentations for %s: %u * %u\n",
+                        F.getName().str().c_str(), inst - inst_save,
+                        call_counter);
+
+            }
 
             // ngram: save the caller's prev_loc into a per-function stack
             // alloca, then zero __afl_prev_loc.  History is restored at every
-            // return/resume.
+            // return/resume.  Runs whether or not CTX expanded this function.
             if (ngram_size && AFLPrevLoc) {
 
               PrevLocSave =
@@ -1911,34 +1929,34 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
             }
 
-            if (debug)
-              fprintf(
-                  stderr, "DEBUG: extra CTX instrumentations for %s: %u * %u\n",
-                  F.getName().str().c_str(), inst - inst_save, call_counter);
-
           }
 
-          for (auto &IN : BB) {
+          if (call_counter > 1) {
 
-            // check all calls and where callee count == 1 instrument
-            // our current caller_id to __afl_ctx
-            if (auto callInst = dyn_cast<CallInst>(&IN)) {
+            for (auto &IN : BB) {
 
-              Function *Callee = callInst->getCalledFunction();
-              if (!Callee) continue;
-              if (Callee->isIntrinsic()) continue;
-              if (countCallers(Callee) == 1) {
+              // check all calls and where callee count == 1 instrument
+              // our current caller_id to __afl_ctx
+              if (auto callInst = dyn_cast<CallInst>(&IN)) {
 
-                if (debug)
-                  fprintf(stderr, "DEBUG: %s call to %s with only one caller\n",
-                          F.getName().str().c_str(),
-                          Callee->getName().str().c_str());
+                Function *Callee = callInst->getCalledFunction();
+                if (!Callee) continue;
+                if (Callee->isIntrinsic()) continue;
+                if (countCallers(Callee) == 1) {
 
-                IRBuilder<> Builder(IN.getContext());
-                Builder.SetInsertPoint(callInst);
-                StoreInst *StoreCtx =
-                    Builder.CreateStore(PrevCtxLoad, AFLContext);
-                StoreCtx->setMetadata("nosanitize", N);
+                  if (debug)
+                    fprintf(stderr,
+                            "DEBUG: %s call to %s with only one caller\n",
+                            F.getName().str().c_str(),
+                            Callee->getName().str().c_str());
+
+                  IRBuilder<> Builder(IN.getContext());
+                  Builder.SetInsertPoint(callInst);
+                  StoreInst *StoreCtx =
+                      Builder.CreateStore(PrevCtxLoad, AFLContext);
+                  StoreCtx->setMetadata("nosanitize", N);
+
+                }
 
               }
 
@@ -1963,19 +1981,24 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
   auto applyCtxOffset = [&](IRBuilder<> &IRB, Value *V) -> Value * {
 
-    if (!CTX_add) return V;
-    LoadInst *CTX_load = IRB.CreateLoad(
-#if LLVM_VERSION_MAJOR >= 14
-        IRB.getInt32Ty(),
-#endif
-        CTX_add);
-    setNoSanitizeMetadata(CTX_load);
-    Value *Offset = CTX_load;
-    if (Value *NgOff = computeNgramOffset(IRB)) {
+    Value *Offset = nullptr;
+    if (CTX_add) {
 
-      Offset = IRB.CreateAdd(Offset, NgOff);
+      LoadInst *CTX_load = IRB.CreateLoad(
+#if LLVM_VERSION_MAJOR >= 14
+          IRB.getInt32Ty(),
+#endif
+          CTX_add);
+      setNoSanitizeMetadata(CTX_load);
+      Offset = CTX_load;
 
     }
+    if (Value *NgOff = computeNgramOffset(IRB)) {
+
+      Offset = Offset ? IRB.CreateAdd(Offset, NgOff) : NgOff;
+
+    }
+    if (!Offset) return V;
     return IRB.CreateAdd(V, Offset);
 
   };
@@ -2444,7 +2467,10 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
     }
 
-    if (!instrument_ctx || call_counter <= 1)
+    /* The fake-instrumentation pass runs (and populates BlocksToInstrument)
+       whenever (call_counter > 1 || ngram_size).  In every other case BBs
+       need to be added here as a fallback. */
+    if (!instrument_ctx || (call_counter <= 1 && !ngram_size))
       if (shouldInstrumentBlock(F, &BB, DT, PDT, Options))
         BlocksToInstrument.push_back(&BB);
 
@@ -2479,7 +2505,7 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
   }
 
-  if (inst_in_this_func && call_counter > 1) {
+  if (inst_in_this_func && (call_counter > 1 || ngram_size)) {
 
     if (inst_in_this_func != afl_global_id - save_global) {
 
@@ -2492,17 +2518,19 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
     }
 
     uint32_t extra_ctx_inst_in_this_func;
+    /* Effective C for sizing: real call_counter if CTX expanded, else 1
+       (no caller axis; ngram is the only expansion).                      */
+    uint32_t C_eff = (call_counter > 1) ? call_counter : 1;
 
     if (ngram_size) {
 
-      // Strict non-colliding ngram: per-function reservation = I^N * C.
+      // Strict non-colliding ngram: per-function reservation = I^N * C_eff.
       // I edges are already counted in inst_in_this_func; reserve the rest.
       uint64_t I = inst_in_this_func;
-      uint64_t C = call_counter;
-      uint64_t Total = I * C;  // I^1 * C
+      uint64_t Total = I * (uint64_t)C_eff;  // I^1 * C_eff
       for (uint32_t i = 1; i < ngram_size; ++i) {
 
-        Total *= I;  // becomes I^N * C in the end
+        Total *= I;  // becomes I^N * C_eff in the end
 
       }
       // Cap at 2,000,000 total program edges.
@@ -2524,7 +2552,7 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
     } else {
 
       extra_ctx_inst_in_this_func =
-          inst_in_this_func * (call_counter - 1);
+          inst_in_this_func * (C_eff - 1);
 
     }
 
@@ -2690,6 +2718,7 @@ void ModuleSanitizerCoverageLTO::InjectCoverageAtBlock(Function   &F,
     ConstantInt *CurLoc = ConstantInt::get(Int32Tyi, afl_global_id);
     Value       *val = CurLoc;
 
+    Value *Offset = nullptr;
     if (CTX_add) {
 
       LoadInst *CTX_load = IRB.CreateLoad(
@@ -2698,15 +2727,15 @@ void ModuleSanitizerCoverageLTO::InjectCoverageAtBlock(Function   &F,
 #endif
           CTX_add);
       setNoSanitizeMetadata(CTX_load);
-      Value *Offset = CTX_load;
-      if (Value *NgOff = computeNgramOffset(IRB)) {
-
-        Offset = IRB.CreateAdd(Offset, NgOff);
-
-      }
-      val = IRB.CreateAdd(CurLoc, Offset);
+      Offset = CTX_load;
 
     }
+    if (Value *NgOff = computeNgramOffset(IRB)) {
+
+      Offset = Offset ? IRB.CreateAdd(Offset, NgOff) : NgOff;
+
+    }
+    if (Offset) { val = IRB.CreateAdd(CurLoc, Offset); }
 
     // Apply IJON state-aware coverage if enabled
     if (ijon_enabled && AFLIJONState) {
