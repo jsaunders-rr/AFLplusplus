@@ -2444,7 +2444,7 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
 
     }
 
-    if (!instrument_ctx)
+    if (!instrument_ctx || call_counter <= 1)
       if (shouldInstrumentBlock(F, &BB, DT, PDT, Options))
         BlocksToInstrument.push_back(&BB);
 
